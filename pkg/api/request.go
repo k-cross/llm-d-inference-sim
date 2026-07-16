@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"github.com/llm-d/llm-d-inference-sim/pkg/retention"
 )
 
 const (
@@ -122,6 +124,12 @@ type Request interface {
 	SetSendImage(bool)
 	// SendImage reports whether an image will be emitted with this response.
 	SendImage() bool
+
+	// GetRetentionDirective returns the KV-cache retention directive extracted from the
+	// request (RFC-0001), or nil when the request carries no directive (plain LRU).
+	GetRetentionDirective() *retention.RetentionDirective
+	// SetRetentionDirective sets the KV-cache retention directive.
+	SetRetentionDirective(*retention.RetentionDirective)
 }
 
 // baseRequest contains base completions request related information
@@ -151,6 +159,9 @@ type baseRequest struct {
 	tokenizedPromptForEcho *Tokenized
 	// mmFeatures holds multimodal metadata produced by the tokenizer, exists only for multimodal requests
 	mmFeatures *RenderMMFeatures
+	// retentionDirective is the KV-cache retention hint extracted from the request's HTTP
+	// header (RFC-0001), nil when the request carries no directive
+	retentionDirective *retention.RetentionDirective
 }
 
 // baseCompletionsRequest contains base completions request related information
@@ -371,6 +382,16 @@ func (b *baseRequest) SetMMFeatures(mmFeatures *RenderMMFeatures) {
 
 func (b *baseRequest) SetSendImage(bool) {}
 func (b *baseRequest) SendImage() bool   { return false }
+
+// GetRetentionDirective returns the KV-cache retention directive, or nil if none was set.
+func (b *baseRequest) GetRetentionDirective() *retention.RetentionDirective {
+	return b.retentionDirective
+}
+
+// SetRetentionDirective sets the KV-cache retention directive.
+func (b *baseRequest) SetRetentionDirective(directive *retention.RetentionDirective) {
+	b.retentionDirective = directive
+}
 
 func (b *baseCompletionsRequest) IncludeUsage() bool {
 	return !b.Stream || (b.StreamOptions != nil && b.StreamOptions.IncludeUsage)

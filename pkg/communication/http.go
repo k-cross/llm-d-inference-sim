@@ -36,6 +36,7 @@ import (
 	"github.com/llm-d/llm-d-inference-sim/pkg/common"
 	"github.com/llm-d/llm-d-inference-sim/pkg/common/logging"
 	vllmsim "github.com/llm-d/llm-d-inference-sim/pkg/llm-d-inference-sim"
+	"github.com/llm-d/llm-d-inference-sim/pkg/retention"
 )
 
 const (
@@ -271,6 +272,17 @@ func (c *Communication) handleHTTP(req vllmsim.Request, respBuilder responseBuil
 			sendImg = c.simulator.Context.Random.RandomInt(1, 100) <= cfg.ImageEmissionRate
 		}
 		req.SetSendImage(sendImg)
+	}
+
+	// Check for the KV-cache retention directive header (RFC-0001 §2, router path). A
+	// malformed directive is logged and ignored -- a hint never fails a request.
+	if directiveValue := string(ctx.Request.Header.Peek(retention.KVCachePriorityHeader)); directiveValue != "" {
+		if directive, ok := retention.ParseRetentionHeader(directiveValue); ok {
+			req.SetRetentionDirective(directive)
+		} else {
+			c.logger.V(logging.DEBUG).Info("ignoring malformed KV-cache retention header",
+				"header", retention.KVCachePriorityHeader, "value", directiveValue)
+		}
 	}
 
 	numChoices, isStream, channel, err, errInjected := c.simulator.HandleRequest(req)

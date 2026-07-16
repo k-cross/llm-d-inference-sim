@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/llm-d/llm-d-inference-sim/pkg/common"
+	"github.com/llm-d/llm-d-inference-sim/pkg/retention"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -48,6 +49,7 @@ type testRequest struct {
 	loraID      *int
 	blockHashes []uint64
 	tokens      [][]uint32
+	directive   *retention.RetentionDirective
 }
 
 // ensure testRequest implements the Request interface
@@ -70,6 +72,10 @@ func (t *testRequest) GetLoraName() *string {
 
 func (t *testRequest) GetLoraID() *int {
 	return t.loraID
+}
+
+func (t *testRequest) GetRetentionDirective() *retention.RetentionDirective {
+	return t.directive
 }
 
 type expectedBlockInfo struct {

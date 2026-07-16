@@ -26,6 +26,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-inference-sim/pkg/common"
 	"github.com/llm-d/llm-d-inference-sim/pkg/common/logging"
+	"github.com/llm-d/llm-d-inference-sim/pkg/retention"
 )
 
 const (
@@ -42,11 +43,23 @@ type Request interface {
 	GetDisplayedModel() string
 	GetLoraName() *string
 	GetLoraID() *int
+	// GetRetentionDirective returns the KV-cache retention directive attached to this
+	// request (RFC-0001), or nil when the request is unmarked (plain LRU).
+	GetRetentionDirective() *retention.RetentionDirective
 }
 
 type blockKey struct {
 	hash      uint64
 	modelName string
+}
+
+// retentionMark is a block's live retention directive (RFC-0001 §1): a numeric priority
+// and a wall-clock lease expiry. The expiry is always set to a bounded, non-zero time (see
+// applyDirective / retention.EffectiveTTL) -- there are no persistent marks -- and once it
+// is in the past the block collapses back to unmarked.
+type retentionMark struct {
+	priority int
+	expiry   time.Time
 }
 
 // blockCache represents a thread-safe cache for blocks with eviction policy
@@ -56,6 +69,8 @@ type blockCache struct {
 	usedBlocks      map[blockKey]int                   // block hash -> reference count
 	unusedBlocks    map[blockKey]time.Time             // block hash -> last usage timestamp
 	blockToTokens   map[blockKey][]uint32              // block hash -> block tokens
+	retention       map[blockKey]retentionMark         // block hash -> live retention directive (RFC-0001)
+	pinnedEvictions int                                // marked-and-unexpired blocks evicted under pressure (RFC-0001 §4)
 	loadedModels    map[string]struct{}                // models currently loaded (base model + loaded loras)
 	maxBlocks       int                                // maximum number of blocks in the cache
 	eventSender     *KVEventSender                     // emits kv events
@@ -94,6 +109,7 @@ func newBlockCache(ctx context.Context, config *common.Configuration, logger log
 		usedBlocks:      make(map[blockKey]int),
 		unusedBlocks:    make(map[blockKey]time.Time),
 		blockToTokens:   make(map[blockKey][]uint32),
+		retention:       make(map[blockKey]retentionMark),
 		loadedModels:    make(map[string]struct{}),
 		maxBlocks:       config.KVCacheSize,
 		eventChan:       eChan,
@@ -132,6 +148,7 @@ func (bc *blockCache) discard() {
 	bc.usedBlocks = make(map[blockKey]int)
 	bc.unusedBlocks = make(map[blockKey]time.Time)
 	bc.blockToTokens = make(map[blockKey][]uint32)
+	bc.retention = make(map[blockKey]retentionMark)
 
 	common.WriteToChannel(bc.eventChan,
 		EventData{action: eventActionAllBlocksCleared},
@@ -234,6 +251,7 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 			// cache is full but contains unused blocks - evict one block
 			evictHash := bc.pickBlockToEvict()
 			delete(bc.unusedBlocks, evictHash)
+			delete(bc.retention, evictHash)
 			common.WriteToChannel(bc.eventChan,
 				EventData{action: eventActionRemove, hashes: []uint64{evictHash.hash},
 					tokens: bc.blockToTokens[evictHash]},
@@ -275,6 +293,23 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 	for i, blockHash := range blockHashes {
 		bKey := blockKey{hash: blockHash, modelName: req.GetDisplayedModel()}
 		bc.requestToBlocks[req.GetRequestID()][i] = bKey
+	}
+
+	// Apply the request's retention directive to its whole prefix (RFC-0001 §2, router
+	// scope). A request with no directive resets its prefix to plain LRU, mirroring the
+	// offline sim's pin-clearing (RFC-0001 §1) so a mark can be demoted by later traffic and
+	// not only escalated. The clear only runs when some mark actually exists, keeping the
+	// common non-agentic workload on the zero-overhead fast path.
+	reqBlocks := bc.requestToBlocks[req.GetRequestID()]
+	if directive := req.GetRetentionDirective(); directive != nil {
+		now := time.Now()
+		for _, bKey := range reqBlocks {
+			bc.applyDirective(bKey, directive, now)
+		}
+	} else if len(bc.retention) > 0 {
+		for _, bKey := range reqBlocks {
+			delete(bc.retention, bKey)
+		}
 	}
 
 	if bc.usageChan != nil {
@@ -400,39 +435,124 @@ func (bc *blockCache) countCachedBlockPrefix(blockHashes []uint64, modelName str
 	return count
 }
 
-// pickBlockToEvict selects the best unused block to evict using priority:
-// 1. oldest unused block of an unloaded model
-// 2. oldest unused block of any model
-// Must be called with bc.mu held.
-func (bc *blockCache) pickBlockToEvict() blockKey {
-	var bestLoadedHash blockKey
-	bestLoadedTime := time.Now()
-	var bestUnloadedHash blockKey
-	bestUnloadedTime := bestLoadedTime
-	hasUnloadedCandidate := false
+// lruCandidate tracks the most-evictable block within an LRU-ordered bucket: an
+// unloaded-model block outranks a loaded-model one, and within the same class the oldest
+// (least-recently-used) wins -- the base eviction order upstream uses.
+type lruCandidate struct {
+	key    blockKey
+	loaded bool
+	t      time.Time
+	have   bool
+}
 
-	for blockKey, t := range bc.unusedBlocks {
-		if _, exists := bc.loadedModels[blockKey.modelName]; exists {
-			// this is a block with loaded model,
-			// check if it's the best candidate among loaded models
-			if t.Before(bestLoadedTime) {
-				bestLoadedHash = blockKey
-				bestLoadedTime = t
+// consider replaces the incumbent when bk is a stronger eviction target than it.
+func (c *lruCandidate) consider(bk blockKey, loaded bool, t time.Time) {
+	if c.have {
+		if loaded != c.loaded {
+			if loaded {
+				return // an unloaded incumbent always beats a loaded candidate
 			}
-		} else {
-			// this is a block with unloaded model,
-			// check if it's the best candidate among unloaded models
-			if t.Before(bestUnloadedTime) {
-				bestUnloadedHash = blockKey
-				bestUnloadedTime = t
-				hasUnloadedCandidate = true
-			}
+		} else if !t.Before(c.t) {
+			return // same class, incumbent is at least as old (more evictable)
 		}
 	}
-	if hasUnloadedCandidate {
-		return bestUnloadedHash
+	c.key, c.loaded, c.t, c.have = bk, loaded, t, true
+}
+
+// pickBlockToEvict selects the unused block to evict, honoring the RFC-0001 §3 retention
+// ranks layered on the base unloaded-model-first LRU. Effective rank orders
+// evict-first < unmarked < marked (priority ascending); TTL expiry collapses a mark to
+// unmarked. The lowest non-empty rank is drained first, so a marked block is only
+// sacrificed when nothing cheaper is resident -- and that sacrifice is counted as pinned
+// pressure (RFC-0001 §4). A single pass buckets every unused block by rank and prunes
+// expired leases as it goes, so the no-directive fast path re-engages once all leases
+// lapse. Must be called with bc.mu held.
+func (bc *blockCache) pickBlockToEvict() blockKey {
+	// Fast path: no live directives anywhere -> plain unloaded-first LRU, no per-block
+	// retention lookups, preserving zero overhead for non-agentic workloads.
+	if len(bc.retention) == 0 {
+		var lru lruCandidate
+		for bk, t := range bc.unusedBlocks {
+			_, loaded := bc.loadedModels[bk.modelName]
+			lru.consider(bk, loaded, t)
+		}
+		return lru.key
 	}
-	return bestLoadedHash
+
+	now := time.Now()
+	var evictFirst, unmarked lruCandidate
+	var marked blockKey
+	var markedMark retentionMark
+	var markedTime time.Time
+	haveMarked := false
+
+	for bk, t := range bc.unusedBlocks {
+		mark, isMarked := bc.retention[bk]
+		if isMarked && !now.Before(mark.expiry) {
+			delete(bc.retention, bk) // lease lapsed -> prune and treat as unmarked
+			isMarked = false
+		}
+		_, loaded := bc.loadedModels[bk.modelName]
+		switch {
+		case !isMarked:
+			unmarked.consider(bk, loaded, t)
+		case mark.priority < 0:
+			evictFirst.consider(bk, loaded, t)
+		case !haveMarked || markLessValuable(mark.priority, mark.expiry, t,
+			markedMark.priority, markedMark.expiry, markedTime):
+			marked, markedMark, markedTime, haveMarked = bk, mark, t, true
+		}
+	}
+
+	if evictFirst.have {
+		return evictFirst.key
+	}
+	if unmarked.have {
+		return unmarked.key
+	}
+	// Every unused block is marked-and-unexpired: sacrifice the least valuable pin and
+	// record the pressure (RFC-0001 §1/§4).
+	bc.pinnedEvictions++
+	return marked
+}
+
+// markLessValuable reports whether mark A is a better eviction target than mark B: lower
+// priority wins; on a tie the soonest-expiring lease; on a further tie the older block.
+// (All marks carry a bounded, non-zero expiry, so there is no persistent-lease case.)
+func markLessValuable(prioA int, expiryA, timeA time.Time, prioB int, expiryB, timeB time.Time) bool {
+	if prioA != prioB {
+		return prioA < prioB
+	}
+	if !expiryA.Equal(expiryB) {
+		return expiryA.Before(expiryB)
+	}
+	return timeA.Before(timeB)
+}
+
+// getPinnedEvictions returns the number of marked-and-unexpired blocks evicted under
+// capacity pressure -- the router's over-pin signal (RFC-0001 §4).
+func (bc *blockCache) getPinnedEvictions() int {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.pinnedEvictions
+}
+
+// applyDirective records (or escalates) a block's retention mark from a request's directive.
+// A shared block carries the maximum of the live directives covering it (RFC-0001 §1): a
+// higher priority wins, and on a tie the later-expiring lease is kept. The lease is bounded
+// by the server policy (retention.EffectiveTTL), so the mark is never persistent. Priority
+// is trusted to be in range -- ParseRetentionHeader has already rejected out-of-range hints.
+func (bc *blockCache) applyDirective(bk blockKey, directive *retention.RetentionDirective, now time.Time) {
+	newPriority := directive.Priority
+	newExpiry := now.Add(retention.EffectiveTTL(directive.TTL))
+
+	if existing, ok := bc.retention[bk]; ok {
+		if now.Before(existing.expiry) &&
+			!markLessValuable(existing.priority, existing.expiry, now, newPriority, newExpiry, now) {
+			return // existing mark is still live and at least as strong -> keep it
+		}
+	}
+	bc.retention[bk] = retentionMark{priority: newPriority, expiry: newExpiry}
 }
 
 func (bc *blockCache) setModelLoaded(model string) {
