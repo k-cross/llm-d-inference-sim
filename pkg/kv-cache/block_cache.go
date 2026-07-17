@@ -53,6 +53,16 @@ type blockKey struct {
 	modelName string
 }
 
+// PrioritySnapshot carries per-priority-band block counts and the pinned-eviction
+// pressure counter for the Prometheus metrics layer (RFC-0001 §4).
+type PrioritySnapshot struct {
+	EvictFirstBlocks int
+	HighBlocks       int
+	PinnedBlocks     int
+	PinnedUsagePerc  float64 // (high + pinned) unexpired blocks / maxBlocks; excludes evict-first
+	PinnedEvictions  int     // cumulative counter
+}
+
 // retentionMark is a block's live retention directive (RFC-0001 §1): a numeric priority
 // and a wall-clock lease expiry. The expiry is always set to a bounded, non-zero time (see
 // applyDirective / retention.EffectiveTTL) -- there are no persistent marks -- and once it
@@ -60,29 +70,34 @@ type blockKey struct {
 type retentionMark struct {
 	priority int
 	expiry   time.Time
+	// scope is the directive's scope id (RFC-0001 §2), empty for a router-global mark. A
+	// scoped pin (e.g. a session id) is only demoted by its own scope's traffic or by lease
+	// expiry -- incidental unmarked traffic sharing the prefix does not clear it.
+	scope string
 }
 
 // blockCache represents a thread-safe cache for blocks with eviction policy
 type blockCache struct {
-	mu              sync.RWMutex
-	requestToBlocks map[string][]blockKey              // request id -> array of it blocks (block hashes)
-	usedBlocks      map[blockKey]int                   // block hash -> reference count
-	unusedBlocks    map[blockKey]time.Time             // block hash -> last usage timestamp
-	blockToTokens   map[blockKey][]uint32              // block hash -> block tokens
-	retention       map[blockKey]retentionMark         // block hash -> live retention directive (RFC-0001)
-	pinnedEvictions int                                // marked-and-unexpired blocks evicted under pressure (RFC-0001 §4)
-	loadedModels    map[string]struct{}                // models currently loaded (base model + loaded loras)
-	maxBlocks       int                                // maximum number of blocks in the cache
-	eventSender     *KVEventSender                     // emits kv events
-	eventChan       common.Channel[EventData]          // channel for asynchronous event processing
-	usageChan       *common.Channel[common.MetricInfo] // channel for usage reporting
-	logger          logr.Logger
-	disabled        bool // indicated whether the cache is disabled
+	mu                sync.RWMutex
+	requestToBlocks   map[string][]blockKey              // request id -> array of it blocks (block hashes)
+	usedBlocks        map[blockKey]int                   // block hash -> reference count
+	unusedBlocks      map[blockKey]time.Time             // block hash -> last usage timestamp
+	blockToTokens     map[blockKey][]uint32              // block hash -> block tokens
+	retention         map[blockKey]retentionMark         // block hash -> live retention directive (RFC-0001)
+	pinnedEvictions   int                                // marked-and-unexpired blocks evicted under pressure (RFC-0001 §4)
+	loadedModels      map[string]struct{}                // models currently loaded (base model + loaded loras)
+	maxBlocks         int                                // maximum number of blocks in the cache
+	eventSender       *KVEventSender                     // emits kv events
+	eventChan         common.Channel[EventData]          // channel for asynchronous event processing
+	usageChan         *common.Channel[common.MetricInfo] // channel for usage reporting
+	priorityStatsChan *common.Channel[PrioritySnapshot]  // per-band block counts + pinned-usage (RFC-0001 §4)
+	logger            logr.Logger
+	disabled          bool // indicated whether the cache is disabled
 }
 
 // newBlockCache creates a new blockCache with the specified maximum number of blocks
 func newBlockCache(ctx context.Context, config *common.Configuration, logger logr.Logger,
-	usageChan *common.Channel[common.MetricInfo]) (*blockCache, error) {
+	usageChan *common.Channel[common.MetricInfo], priorityStatsChan *common.Channel[PrioritySnapshot]) (*blockCache, error) {
 	if config.IP == "" {
 		return nil, errors.New("IP should be defined in the environment (POD_IP)")
 	}
@@ -105,17 +120,18 @@ func newBlockCache(ctx context.Context, config *common.Configuration, logger log
 		eChan, config.EventBatchSize, config.TokenBlockSize, delay, config.UseVllmMapEventFormat, logger)
 
 	bCache := blockCache{
-		requestToBlocks: make(map[string][]blockKey),
-		usedBlocks:      make(map[blockKey]int),
-		unusedBlocks:    make(map[blockKey]time.Time),
-		blockToTokens:   make(map[blockKey][]uint32),
-		retention:       make(map[blockKey]retentionMark),
-		loadedModels:    make(map[string]struct{}),
-		maxBlocks:       config.KVCacheSize,
-		eventChan:       eChan,
-		usageChan:       usageChan,
-		eventSender:     eventSender,
-		logger:          logger,
+		requestToBlocks:   make(map[string][]blockKey),
+		usedBlocks:        make(map[blockKey]int),
+		unusedBlocks:      make(map[blockKey]time.Time),
+		blockToTokens:     make(map[blockKey][]uint32),
+		retention:         make(map[blockKey]retentionMark),
+		loadedModels:      make(map[string]struct{}),
+		maxBlocks:         config.KVCacheSize,
+		eventChan:         eChan,
+		usageChan:         usageChan,
+		priorityStatsChan: priorityStatsChan,
+		eventSender:       eventSender,
+		logger:            logger,
 	}
 
 	// mark the base model and all it aliases as always loaded,
@@ -153,6 +169,11 @@ func (bc *blockCache) discard() {
 	common.WriteToChannel(bc.eventChan,
 		EventData{action: eventActionAllBlocksCleared},
 		bc.logger)
+
+	// retention was just cleared; push a fresh (zeroed) snapshot so the priority-band gauges
+	// and pinned-usage do not report phantom occupancy for the now-empty cache until the next
+	// request arrives.
+	bc.pushPriorityStats()
 }
 
 func (bc *blockCache) activate() {
@@ -269,6 +290,19 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 		tokens = append(tokens, bc.blockToTokens[block.key]...)
 	}
 
+	var priority *int
+	var retainUntil *float64
+	now := time.Now()
+	directive := req.GetRetentionDirective()
+	if directive != nil {
+		p := directive.Priority
+		priority = &p
+		// RFC-0001 §4: retain_until is the lease expiry as float64 unix seconds so a
+		// retention-aware consumer can compute expiry directly (not an RFC3339 string).
+		ru := float64(now.Add(retention.EffectiveTTL(directive.TTL)).UnixNano()) / 1e9
+		retainUntil = &ru
+	}
+
 	if len(hashes) > 0 {
 		// parent is the last already-cached block; nil when all blocks are new.
 		var parentHash *uint64
@@ -276,15 +310,7 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 			ph := blockHashes[lastCachedIdx]
 			parentHash = &ph
 		}
-		common.WriteToChannel(bc.eventChan,
-			EventData{
-				action:     eventActionStore,
-				hashes:     hashes,
-				tokens:     tokens,
-				parentHash: parentHash,
-				loraName:   req.GetLoraName(),
-				loraID:     req.GetLoraID(),
-			}, bc.logger)
+		bc.emitStore(req, hashes, tokens, parentHash, priority, retainUntil)
 	}
 
 	// store the request mapping
@@ -301,14 +327,48 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 	// not only escalated. The clear only runs when some mark actually exists, keeping the
 	// common non-agentic workload on the zero-overhead fast path.
 	reqBlocks := bc.requestToBlocks[req.GetRequestID()]
-	if directive := req.GetRetentionDirective(); directive != nil {
-		now := time.Now()
+
+	if directive != nil {
+		// newBlocksSet is only needed to skip re-emitting blocks stored moments ago above,
+		// so build it only on the directive path -- the common unmarked workload stays
+		// allocation-free here (RFC-0001 §4 zero-overhead invariant).
+		newBlocksSet := make(map[blockKey]bool, len(blocksToAdd))
+		for _, b := range blocksToAdd {
+			newBlocksSet[b.key] = true
+		}
+		var escalatedHashes []uint64
+		var escalatedTokens []uint32
 		for _, bKey := range reqBlocks {
-			bc.applyDirective(bKey, directive, now)
+			updated := bc.applyDirective(bKey, directive, now)
+			if updated && !newBlocksSet[bKey] {
+				escalatedHashes = append(escalatedHashes, bKey.hash)
+				escalatedTokens = append(escalatedTokens, bc.blockToTokens[bKey]...)
+			}
+		}
+		// Re-emit BlockStored for the already-cached blocks whose mark changed so a
+		// retention-aware indexer learns the new priority (idempotent upsert keyed on block
+		// hash). parentHash is nil: escalated blocks are the request's cached prefix, i.e.
+		// they start at the sequence head, so their chain parent is genuinely absent.
+		if len(escalatedHashes) > 0 {
+			bc.emitStore(req, escalatedHashes, escalatedTokens, nil, priority, retainUntil)
 		}
 	} else if len(bc.retention) > 0 {
+		// Unmarked re-admit demotes this prefix to plain LRU (RFC-0001 §1), but only for
+		// router-global (unscoped) marks: a scoped pin belongs to its own session/program and
+		// must not be stomped by incidental unmarked traffic that merely shares the prefix.
+		// A demotion is a priority change, so re-emit BlockStored (no priority/retain_until)
+		// for the cleared blocks, symmetric with escalation.
+		var demotedHashes []uint64
+		var demotedTokens []uint32
 		for _, bKey := range reqBlocks {
-			delete(bc.retention, bKey)
+			if mark, marked := bc.retention[bKey]; marked && mark.scope == "" {
+				delete(bc.retention, bKey)
+				demotedHashes = append(demotedHashes, bKey.hash)
+				demotedTokens = append(demotedTokens, bc.blockToTokens[bKey]...)
+			}
+		}
+		if len(demotedHashes) > 0 {
+			bc.emitStore(req, demotedHashes, demotedTokens, nil, nil, nil)
 		}
 	}
 
@@ -318,6 +378,7 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 		}
 		common.WriteToChannel(*bc.usageChan, usage, bc.logger)
 	}
+	bc.pushPriorityStats()
 	return len(blockAlreadyInUse) + len(blockToMoveToUsed), nil
 }
 
@@ -362,6 +423,7 @@ func (bc *blockCache) finishRequest(requestID string) error {
 		}
 		common.WriteToChannel(*bc.usageChan, usage, bc.logger)
 	}
+	bc.pushPriorityStats()
 
 	// Remove the request mapping
 	delete(bc.requestToBlocks, requestID)
@@ -537,22 +599,77 @@ func (bc *blockCache) getPinnedEvictions() int {
 	return bc.pinnedEvictions
 }
 
+// pushPriorityStats computes per-priority-band block counts and pushes them to
+// the Prometheus metrics layer. When there are no live retention marks, zeroed
+// bands are pushed (no per-block iteration) preserving the zero-overhead
+// invariant for non-agentic workloads (RFC-0001 §4).
+func (bc *blockCache) pushPriorityStats() {
+	if bc.priorityStatsChan == nil {
+		return
+	}
+	snap := PrioritySnapshot{PinnedEvictions: bc.pinnedEvictions}
+	if len(bc.retention) > 0 {
+		now := time.Now()
+		for bk, mark := range bc.retention {
+			if now.Before(mark.expiry) {
+				switch {
+				case mark.priority <= retention.EvictFirstPriority:
+					snap.EvictFirstBlocks++
+				case mark.priority >= retention.PinnedPriority:
+					snap.PinnedBlocks++
+				default:
+					snap.HighBlocks++
+				}
+			} else {
+				// Prune the lapsed lease here too (not only in pickBlockToEvict) so the map
+				// empties and the len==0 fast path re-engages even without eviction pressure.
+				delete(bc.retention, bk)
+			}
+		}
+		// Pinned usage is retention *above* plain LRU: evict-first blocks (priority < 0) are
+		// below-normal, so they are excluded -- counting them would inflate the over-pin
+		// pressure signal with blocks that are the opposite of pinned (RFC-0001 §4).
+		total := snap.HighBlocks + snap.PinnedBlocks
+		snap.PinnedUsagePerc = float64(total) / float64(bc.maxBlocks)
+	}
+	common.WriteToChannel(*bc.priorityStatsChan, snap, bc.logger)
+}
+
+// emitStore queues a BlockStored event for the given blocks. parentHash links the first
+// block to its cached predecessor (nil = sequence head or a priority-change re-emit);
+// priority and retainUntil carry the retention mark, both nil for unmarked or demoted blocks.
+// Must be called with bc.mu held (it only writes to the async event channel).
+func (bc *blockCache) emitStore(req Request, hashes []uint64, tokens []uint32, parentHash *uint64, priority *int, retainUntil *float64) {
+	common.WriteToChannel(bc.eventChan,
+		EventData{
+			action:      eventActionStore,
+			hashes:      hashes,
+			tokens:      tokens,
+			parentHash:  parentHash,
+			loraName:    req.GetLoraName(),
+			loraID:      req.GetLoraID(),
+			priority:    priority,
+			retainUntil: retainUntil,
+		}, bc.logger)
+}
+
 // applyDirective records (or escalates) a block's retention mark from a request's directive.
 // A shared block carries the maximum of the live directives covering it (RFC-0001 §1): a
 // higher priority wins, and on a tie the later-expiring lease is kept. The lease is bounded
 // by the server policy (retention.EffectiveTTL), so the mark is never persistent. Priority
 // is trusted to be in range -- ParseRetentionHeader has already rejected out-of-range hints.
-func (bc *blockCache) applyDirective(bk blockKey, directive *retention.RetentionDirective, now time.Time) {
+func (bc *blockCache) applyDirective(bk blockKey, directive *retention.RetentionDirective, now time.Time) bool {
 	newPriority := directive.Priority
 	newExpiry := now.Add(retention.EffectiveTTL(directive.TTL))
 
 	if existing, ok := bc.retention[bk]; ok {
 		if now.Before(existing.expiry) &&
 			!markLessValuable(existing.priority, existing.expiry, now, newPriority, newExpiry, now) {
-			return // existing mark is still live and at least as strong -> keep it
+			return false // existing mark is still live and at least as strong -> keep it
 		}
 	}
-	bc.retention[bk] = retentionMark{priority: newPriority, expiry: newExpiry}
+	bc.retention[bk] = retentionMark{priority: newPriority, expiry: newExpiry, scope: directive.Scope}
+	return true
 }
 
 func (bc *blockCache) setModelLoaded(model string) {

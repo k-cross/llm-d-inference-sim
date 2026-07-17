@@ -34,28 +34,31 @@ import (
 )
 
 const (
-	E2EReqLatencyMetricName          = "vllm:e2e_request_latency_seconds"
-	ReqQueueTimeMetricName           = "vllm:request_queue_time_seconds"
-	ReqInferenceTimeMetricName       = "vllm:request_inference_time_seconds"
-	PrefillTimeMetricName            = "vllm:request_prefill_time_seconds"
-	DecodeTimeMetricName             = "vllm:request_decode_time_seconds"
-	TTFTMetricName                   = "vllm:time_to_first_token_seconds"
-	TPOTMetricName                   = "vllm:time_per_output_token_seconds"
-	InterTokenLatencyMetricName      = "vllm:inter_token_latency_seconds"
-	MaxNumGenerationTokensMetricName = "vllm:max_num_generation_tokens"
-	GenerationTokensMetricName       = "vllm:request_generation_tokens"
-	ParamMaxTokensMetricName         = "vllm:request_params_max_tokens"
-	PromptTokensMetricName           = "vllm:request_prompt_tokens"
-	GenerationTokensTotalMetricName  = "vllm:generation_tokens_total"
-	PromptTokensTotalMetricName      = "vllm:prompt_tokens_total"
-	SuccessTotalMetricName           = "vllm:request_success_total"
-	LoRARequestsMetricName           = "vllm:lora_requests_info"
-	ReqRunningMetricName             = "vllm:num_requests_running"
-	ReqWaitingMetricName             = "vllm:num_requests_waiting"
-	KVCacheUsageMetricName           = "vllm:kv_cache_usage_perc"
-	CacheConfigName                  = "vllm:cache_config_info"
-	PrefixCacheHitsMetricName        = "vllm:prefix_cache_hits"
-	PrefixCacheQueriesMetricName     = "vllm:prefix_cache_queries"
+	E2EReqLatencyMetricName               = "vllm:e2e_request_latency_seconds"
+	ReqQueueTimeMetricName                = "vllm:request_queue_time_seconds"
+	ReqInferenceTimeMetricName            = "vllm:request_inference_time_seconds"
+	PrefillTimeMetricName                 = "vllm:request_prefill_time_seconds"
+	DecodeTimeMetricName                  = "vllm:request_decode_time_seconds"
+	TTFTMetricName                        = "vllm:time_to_first_token_seconds"
+	TPOTMetricName                        = "vllm:time_per_output_token_seconds"
+	InterTokenLatencyMetricName           = "vllm:inter_token_latency_seconds"
+	MaxNumGenerationTokensMetricName      = "vllm:max_num_generation_tokens"
+	GenerationTokensMetricName            = "vllm:request_generation_tokens"
+	ParamMaxTokensMetricName              = "vllm:request_params_max_tokens"
+	PromptTokensMetricName                = "vllm:request_prompt_tokens"
+	GenerationTokensTotalMetricName       = "vllm:generation_tokens_total"
+	PromptTokensTotalMetricName           = "vllm:prompt_tokens_total"
+	SuccessTotalMetricName                = "vllm:request_success_total"
+	LoRARequestsMetricName                = "vllm:lora_requests_info"
+	ReqRunningMetricName                  = "vllm:num_requests_running"
+	ReqWaitingMetricName                  = "vllm:num_requests_waiting"
+	KVCacheUsageMetricName                = "vllm:kv_cache_usage_perc"
+	CacheConfigName                       = "vllm:cache_config_info"
+	PrefixCacheHitsMetricName             = "vllm:prefix_cache_hits"
+	PrefixCacheQueriesMetricName          = "vllm:prefix_cache_queries"
+	KVCachePriorityBlocksMetricName       = "vllm:kv_cache_priority_blocks"
+	KVCachePinnedUsagePercMetricName      = "vllm:kv_cache_pinned_usage_perc"
+	KVCachePinnedEvictionsTotalMetricName = "vllm:kv_cache_pinned_evictions_total"
 )
 
 const (
@@ -155,6 +158,17 @@ type metricsData struct {
 	prefixCacheQueries *prometheus.CounterVec
 	// prefixCacheStatsChan is a channel to update prefix cache hit/query counters
 	prefixCacheStatsChan common.Channel[kvcache.PrefixCacheStats]
+
+	// kvCachePriorityBlocks is a per-band gauge for marked resident blocks (RFC-0001 §4)
+	kvCachePriorityBlocks *prometheus.GaugeVec
+	// kvCachePinnedUsagePerc is the fraction of cache occupied by marked-and-unexpired blocks
+	kvCachePinnedUsagePerc *prometheus.GaugeVec
+	// kvCachePinnedEvictionsTotal is the cumulative count of marked-but-evicted blocks
+	kvCachePinnedEvictionsTotal *prometheus.CounterVec
+	// priorityStatsChan is a channel to update priority block counts + pinned eviction counter
+	priorityStatsChan common.Channel[kvcache.PrioritySnapshot]
+	// lastPinnedEvictions tracks the last-seen pinnedEvictions counter for delta computation
+	lastPinnedEvictions int
 
 	generatedFakeMetrics  map[string]generatedFakeMetrics
 	stopFakeMetricsTicker chan struct{}
@@ -321,6 +335,49 @@ func (s *SimContext) createAndRegisterPrometheus(ctx context.Context) error {
 	}
 	go s.kvCacheUsageUpdater(ctx)
 
+	s.metrics.kvCachePriorityBlocks = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: KVCachePriorityBlocksMetricName,
+			Help: "Number of cache blocks per retention-priority band (RFC-0001 §4).",
+		},
+		[]string{api.PromLabelModelName, "priority"},
+	)
+	if err := s.metrics.registry.Register(s.metrics.kvCachePriorityBlocks); err != nil {
+		s.logger.Error(err, "prometheus kv cache priority blocks gauge register failed")
+		return err
+	}
+
+	s.metrics.kvCachePinnedUsagePerc = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: KVCachePinnedUsagePercMetricName,
+			Help: "Fraction of cache blocks occupied by marked-and-unexpired retention directives (RFC-0001 §4).",
+		},
+		[]string{api.PromLabelModelName},
+	)
+	if err := s.metrics.registry.Register(s.metrics.kvCachePinnedUsagePerc); err != nil {
+		s.logger.Error(err, "prometheus kv cache pinned usage percentage gauge register failed")
+		return err
+	}
+
+	s.metrics.kvCachePinnedEvictionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: KVCachePinnedEvictionsTotalMetricName,
+			Help: "Total number of marked-and-unexpired blocks evicted under capacity pressure (RFC-0001 §4).",
+		},
+		[]string{api.PromLabelModelName},
+	)
+	if err := s.metrics.registry.Register(s.metrics.kvCachePinnedEvictionsTotal); err != nil {
+		s.logger.Error(err, "prometheus kv cache pinned evictions counter register failed")
+		return err
+	}
+
+	s.metrics.priorityStatsChan = common.Channel[kvcache.PrioritySnapshot]{
+		Channel: make(chan kvcache.PrioritySnapshot, maxNumberOfRequests),
+		Name:    "metrics.priorityStatsChan",
+		Done:    ctx.Done(),
+	}
+	go s.priorityStatsUpdater(ctx)
+
 	if err := s.createAndRegisterPrefixCacheHitsMetric(); err != nil {
 		return err
 	}
@@ -399,6 +456,10 @@ func (s *SimContext) setInitialPrometheusMetrics(cacheConfig *prometheus.GaugeVe
 	s.metrics.runningRequests.WithLabelValues(s.Config().DisplayModelName).Set(0)
 	s.metrics.waitingRequests.WithLabelValues(s.Config().DisplayModelName).Set(0)
 	s.metrics.kvCacheUsagePercentage.WithLabelValues(s.Config().DisplayModelName).Set(0)
+	s.metrics.kvCachePriorityBlocks.WithLabelValues(s.Config().DisplayModelName, "evict_first").Set(0)
+	s.metrics.kvCachePriorityBlocks.WithLabelValues(s.Config().DisplayModelName, "high").Set(0)
+	s.metrics.kvCachePriorityBlocks.WithLabelValues(s.Config().DisplayModelName, "pinned").Set(0)
+	s.metrics.kvCachePinnedUsagePerc.WithLabelValues(s.Config().DisplayModelName).Set(0)
 
 	s.metrics.loraInfo.WithLabelValues(
 		strconv.Itoa(s.Config().MaxLoras),
@@ -472,6 +533,33 @@ func (s *SimContext) reportKVCacheUsage(value float64) {
 	}
 }
 
+// reportPriorityStats sets the per-priority-band block gauges and increments the
+// pinned-eviction counter by the delta since the last observation (RFC-0001 §4).
+func (s *SimContext) reportPriorityStats(snap kvcache.PrioritySnapshot) {
+	model := s.Config().DisplayModelName
+	if s.metrics.kvCachePriorityBlocks != nil {
+		s.metrics.kvCachePriorityBlocks.WithLabelValues(model, "evict_first").Set(float64(snap.EvictFirstBlocks))
+		s.metrics.kvCachePriorityBlocks.WithLabelValues(model, "high").Set(float64(snap.HighBlocks))
+		s.metrics.kvCachePriorityBlocks.WithLabelValues(model, "pinned").Set(float64(snap.PinnedBlocks))
+	}
+	if s.metrics.kvCachePinnedUsagePerc != nil {
+		s.metrics.kvCachePinnedUsagePerc.WithLabelValues(model).Set(snap.PinnedUsagePerc)
+	}
+	if s.metrics.kvCachePinnedEvictionsTotal != nil {
+		delta := snap.PinnedEvictions - s.metrics.lastPinnedEvictions
+		if delta < 0 {
+			// The source counter went backwards (the block cache was recreated/reset), so the
+			// snapshot is the new cumulative total -- count it from zero rather than skipping
+			// it, which would undercount every eviction until the old high-water mark.
+			delta = snap.PinnedEvictions
+		}
+		if delta > 0 {
+			s.metrics.kvCachePinnedEvictionsTotal.WithLabelValues(model).Add(float64(delta))
+		}
+		s.metrics.lastPinnedEvictions = snap.PinnedEvictions
+	}
+}
+
 // waitingRequestsUpdater updates the waiting requests metric by listening on the relevant channel
 func (s *SimContext) waitingRequestsUpdater(ctx context.Context) {
 	for {
@@ -540,6 +628,19 @@ func (s *SimContext) prefixCacheStatsUpdater(ctx context.Context) {
 			return
 		case stats := <-s.metrics.prefixCacheStatsChan.Channel:
 			s.reportPrefixCacheStats(stats)
+		}
+	}
+}
+
+// priorityStatsUpdater updates the per-priority-band block gauges and the pinned
+// eviction counter by listening on the relevant channel (RFC-0001 §4).
+func (s *SimContext) priorityStatsUpdater(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case snap := <-s.metrics.priorityStatsChan.Channel:
+			s.reportPriorityStats(snap)
 		}
 	}
 }

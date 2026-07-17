@@ -175,7 +175,7 @@ func (s *SimContext) initialize(ctx context.Context) error {
 	// we don't start it.
 	if s.Config().EnableKVCache && !s.Config().MMEncoderOnly {
 		s.kvcacheHelper, err = kvcache.NewKVCacheHelper(ctx, s.Config(), s.logger,
-			s.metrics.kvCacheUsageChan, s.metrics.prefixCacheStatsChan, s.Tokenizer)
+			s.metrics.kvCacheUsageChan, s.metrics.prefixCacheStatsChan, s.metrics.priorityStatsChan, s.Tokenizer)
 		if err != nil {
 			return err
 		}

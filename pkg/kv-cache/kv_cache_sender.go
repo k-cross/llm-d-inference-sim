@@ -54,10 +54,12 @@ type msgpackBlockStoredEvent struct {
 	ParentBlockHash any
 	TokenIds        []uint32
 	BlockSize       int
-	LoraID          *int    `msgpack:",omitempty"`
-	Medium          *string `msgpack:",omitempty"`
-	LoraName        *string `msgpack:",omitempty"`
-	ExtraKeys       []any   `msgpack:",omitempty"`
+	LoraID          *int     `msgpack:",omitempty"`
+	Medium          *string  `msgpack:",omitempty"`
+	LoraName        *string  `msgpack:",omitempty"`
+	ExtraKeys       []any    `msgpack:",omitempty"`
+	Priority        *int     `msgpack:",omitempty"`
+	RetainUntil     *float64 `msgpack:",omitempty"`
 }
 
 // The Tag field encodes the struct type name under the "type" key, matching
@@ -77,10 +79,12 @@ type blockStoredEvent struct {
 	LoraName        *string  `msgpack:"lora_name,omitempty"`
 	// The following fields are part of the vLLM BlockStoredEvent schema (vllm-project/vllm#42892)
 	// and are reserved for forward-compatibility. They are never populated by this simulator.
-	ExtraKeys                []any   `msgpack:"extra_keys,omitempty"`
-	GroupIdx                 *int    `msgpack:"group_idx,omitempty"`
-	KVCacheSpecKind          *string `msgpack:"kv_cache_spec_kind,omitempty"`
-	KVCacheSpecSlidingWindow *int    `msgpack:"kv_cache_spec_sliding_window,omitempty"`
+	ExtraKeys                []any    `msgpack:"extra_keys,omitempty"`
+	GroupIdx                 *int     `msgpack:"group_idx,omitempty"`
+	KVCacheSpecKind          *string  `msgpack:"kv_cache_spec_kind,omitempty"`
+	KVCacheSpecSlidingWindow *int     `msgpack:"kv_cache_spec_sliding_window,omitempty"`
+	Priority                 *int     `msgpack:"priority,omitempty"`
+	RetainUntil              *float64 `msgpack:"retain_until,omitempty"`
 }
 
 type msgpackBlockRemovedEvent struct {
@@ -108,20 +112,24 @@ type allBlocksClearedEvent struct {
 }
 
 type EventData struct {
-	action     EventAction
-	tokens     []uint32
-	hashes     []uint64
-	parentHash *uint64 // nil means no parent (first block of sequence); non-nil is the last already-cached block hash
-	loraName   *string
-	loraID     *int
+	action      EventAction
+	tokens      []uint32
+	hashes      []uint64
+	parentHash  *uint64 // nil means no parent (first block of sequence); non-nil is the last already-cached block hash
+	loraName    *string
+	loraID      *int
+	priority    *int
+	retainUntil *float64 // RFC-0001 §4: lease expiry as float64 unix seconds (nil = unmarked)
 }
 
 // batchEntry pairs a generic event with the original parentHash pointer so that
 // the map-format encoder can distinguish "no parent" (nil) from a real zero hash,
 // without relying on EmptyBlockHash=0 as a sentinel in the uint64 field.
 type batchEntry struct {
-	event      kvevents.GenericEvent
-	parentHash *uint64 // only meaningful for BlockStoredEvent; nil = no parent
+	event       kvevents.GenericEvent
+	parentHash  *uint64 // only meaningful for BlockStoredEvent; nil = no parent
+	priority    *int
+	retainUntil *float64
 }
 
 type KVEventSender struct {
@@ -197,7 +205,9 @@ func (s *KVEventSender) Run(ctx context.Context) error {
 						LoraID:      eventData.loraID,
 						LoraName:    eventData.loraName,
 					},
-					parentHash: eventData.parentHash,
+					parentHash:  eventData.parentHash,
+					priority:    eventData.priority,
+					retainUntil: eventData.retainUntil,
 				}
 			case eventActionRemove:
 				entry = batchEntry{event: &kvevents.BlockRemovedEvent{BlockHashes: eventData.hashes, DeviceTier: GPU}}
@@ -262,6 +272,8 @@ func encodeEvent(entry batchEntry, mapFormat bool, blockSize int) (interface{}, 
 				LoraName:        e.LoraName,
 				ParentBlockHash: parentBlockHash,
 				BlockSize:       blockSize,
+				Priority:        entry.priority,
+				RetainUntil:     entry.retainUntil,
 			}, nil
 		}
 		return &msgpackBlockStoredEvent{
@@ -273,6 +285,8 @@ func encodeEvent(entry batchEntry, mapFormat bool, blockSize int) (interface{}, 
 			LoraName:        e.LoraName,
 			ParentBlockHash: e.ParentHash,
 			BlockSize:       blockSize,
+			Priority:        entry.priority,
+			RetainUntil:     entry.retainUntil,
 		}, nil
 	case *kvevents.BlockRemovedEvent:
 		if mapFormat {

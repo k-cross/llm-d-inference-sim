@@ -37,7 +37,7 @@ const evTestModel = "model"
 func newTestBlockCache(t *testing.T, capacity int) *blockCache {
 	t.Helper()
 	config := &common.Configuration{IP: localhost, Port: 1234, Model: evTestModel, KVCacheSize: capacity}
-	bc, err := newBlockCache(context.Background(), config, logr.Discard(), nil)
+	bc, err := newBlockCache(context.Background(), config, logr.Discard(), nil, nil)
 	if err != nil {
 		t.Fatalf("newBlockCache: %v", err)
 	}
@@ -179,6 +179,29 @@ func TestUnmarkedReadmitClearsMark(t *testing.T) {
 	}
 	if got := bc.getPinnedEvictions(); got != 0 {
 		t.Errorf("pinnedEvictions = %d, want 0 (nothing is marked after the reset)", got)
+	}
+}
+
+// A *scoped* pin (a session/program directive, RFC-0001 §2) is NOT demoted by incidental
+// unmarked traffic that merely shares its prefix -- only its own scope or lease expiry clears
+// it. Contrast TestUnmarkedReadmitClearsMark, where an unscoped mark IS cleared: without the
+// scope guard, block 1's pin would be stomped by the shared re-admit and evicted here.
+func TestScopedPinSurvivesUnmarkedReadmit(t *testing.T) {
+	bc := newTestBlockCache(t, 3)
+	scoped := &retention.RetentionDirective{
+		Priority: retention.PinnedPriority, TTL: time.Minute, Scope: "session-A",
+	}
+	storeFinished(t, bc, "a", 1, scoped)    // block 1 pinned under scope session-A
+	storeFinished(t, bc, "a-again", 1, nil) // unmarked re-touch by shared traffic -> must NOT clear
+	storeFinished(t, bc, "b", 2, nil)       // unmarked
+	storeFinished(t, bc, "c", 3, nil)       // unmarked
+	triggerEviction(t, bc, "d", 4)          // cache full (3) -> evict one
+
+	if !resident(bc, 1) {
+		t.Error("scoped pin on block 1 should survive incidental unmarked re-admit")
+	}
+	if resident(bc, 2) {
+		t.Error("unmarked block 2 (LRU-oldest) should have been evicted instead of the scoped pin")
 	}
 }
 
