@@ -61,6 +61,7 @@ type PrioritySnapshot struct {
 	PinnedBlocks     int
 	PinnedUsagePerc  float64 // (high + pinned) unexpired blocks / maxBlocks; excludes evict-first
 	PinnedEvictions  int     // cumulative counter
+	TotalEvictions   int     // cumulative count of blocks evicted to make space (any priority)
 }
 
 // retentionMark is a block's live retention directive (RFC-0001 §1): a numeric priority
@@ -85,6 +86,7 @@ type blockCache struct {
 	blockToTokens     map[blockKey][]uint32              // block hash -> block tokens
 	retention         map[blockKey]retentionMark         // block hash -> live retention directive (RFC-0001)
 	pinnedEvictions   int                                // marked-and-unexpired blocks evicted under pressure (RFC-0001 §4)
+	totalEvictions    int                                // any block evicted to make space for a new one (cache-contention signal)
 	loadedModels      map[string]struct{}                // models currently loaded (base model + loaded loras)
 	maxBlocks         int                                // maximum number of blocks in the cache
 	eventSender       *KVEventSender                     // emits kv events
@@ -270,6 +272,7 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 	for _, block := range blocksToAdd {
 		if len(bc.usedBlocks)+len(bc.unusedBlocks) == bc.maxBlocks {
 			// cache is full but contains unused blocks - evict one block
+			bc.totalEvictions++
 			evictHash := bc.pickBlockToEvict()
 			delete(bc.unusedBlocks, evictHash)
 			delete(bc.retention, evictHash)
@@ -599,6 +602,15 @@ func (bc *blockCache) getPinnedEvictions() int {
 	return bc.pinnedEvictions
 }
 
+// getTotalEvictions returns the cumulative count of blocks evicted to make space for new
+// ones, across every priority band -- the direct cache-contention / eviction-pressure
+// signal (RFC-0001 §4).
+func (bc *blockCache) getTotalEvictions() int {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.totalEvictions
+}
+
 // pushPriorityStats computes per-priority-band block counts and pushes them to
 // the Prometheus metrics layer. When there are no live retention marks, zeroed
 // bands are pushed (no per-block iteration) preserving the zero-overhead
@@ -607,7 +619,7 @@ func (bc *blockCache) pushPriorityStats() {
 	if bc.priorityStatsChan == nil {
 		return
 	}
-	snap := PrioritySnapshot{PinnedEvictions: bc.pinnedEvictions}
+	snap := PrioritySnapshot{PinnedEvictions: bc.pinnedEvictions, TotalEvictions: bc.totalEvictions}
 	if len(bc.retention) > 0 {
 		now := time.Now()
 		for bk, mark := range bc.retention {

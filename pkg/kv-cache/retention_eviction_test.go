@@ -223,3 +223,34 @@ func TestUnmarkedWorkloadIsPlainLRU(t *testing.T) {
 		t.Errorf("pinnedEvictions = %d, want 0", got)
 	}
 }
+
+// totalEvictions counts every eviction-to-make-space regardless of priority band -- the
+// contention signal -- while pinnedEvictions counts only the marked-and-unexpired subset.
+func TestTotalEvictionsCountsEveryEviction(t *testing.T) {
+	bc := newTestBlockCache(t, 2)
+	if got := bc.getTotalEvictions(); got != 0 {
+		t.Fatalf("totalEvictions = %d before any eviction, want 0", got)
+	}
+
+	storeFinished(t, bc, "a", 1, directive(retention.HighPriority, time.Hour)) // HIGH, unused
+	storeFinished(t, bc, "b", 2, nil)                                          // unmarked, unused
+	// Cache full {1 HIGH, 2 unmarked}; the new block evicts the unmarked one first
+	// (unmarked < marked), so this is a total eviction but not a pinned one.
+	triggerEviction(t, bc, "c", 3)
+	if got := bc.getTotalEvictions(); got != 1 {
+		t.Fatalf("totalEvictions = %d after one unmarked eviction, want 1", got)
+	}
+	if got := bc.getPinnedEvictions(); got != 0 {
+		t.Fatalf("pinnedEvictions = %d after an unmarked eviction, want 0", got)
+	}
+
+	// Now only block 1 (HIGH) is an unused candidate; admitting another block must
+	// sacrifice it -- a marked eviction that bumps both counters.
+	storeFinished(t, bc, "d", 4, directive(retention.HighPriority, time.Hour))
+	if got := bc.getTotalEvictions(); got != 2 {
+		t.Errorf("totalEvictions = %d, want 2 (every eviction counted)", got)
+	}
+	if got := bc.getPinnedEvictions(); got != 1 {
+		t.Errorf("pinnedEvictions = %d, want 1 (only the marked eviction)", got)
+	}
+}

@@ -59,6 +59,7 @@ const (
 	KVCachePriorityBlocksMetricName       = "vllm:kv_cache_priority_blocks"
 	KVCachePinnedUsagePercMetricName      = "vllm:kv_cache_pinned_usage_perc"
 	KVCachePinnedEvictionsTotalMetricName = "vllm:kv_cache_pinned_evictions_total"
+	KVCacheEvictionsTotalMetricName       = "vllm:kv_cache_evictions_total"
 )
 
 const (
@@ -165,10 +166,15 @@ type metricsData struct {
 	kvCachePinnedUsagePerc *prometheus.GaugeVec
 	// kvCachePinnedEvictionsTotal is the cumulative count of marked-but-evicted blocks
 	kvCachePinnedEvictionsTotal *prometheus.CounterVec
+	// kvCacheEvictionsTotal is the cumulative count of blocks evicted to make space (any
+	// priority) -- the direct cache-contention / eviction-pressure signal
+	kvCacheEvictionsTotal *prometheus.CounterVec
 	// priorityStatsChan is a channel to update priority block counts + pinned eviction counter
 	priorityStatsChan common.Channel[kvcache.PrioritySnapshot]
 	// lastPinnedEvictions tracks the last-seen pinnedEvictions counter for delta computation
 	lastPinnedEvictions int
+	// lastEvictions tracks the last-seen totalEvictions counter for delta computation
+	lastEvictions int
 
 	generatedFakeMetrics  map[string]generatedFakeMetrics
 	stopFakeMetricsTicker chan struct{}
@@ -371,6 +377,18 @@ func (s *SimContext) createAndRegisterPrometheus(ctx context.Context) error {
 		return err
 	}
 
+	s.metrics.kvCacheEvictionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: KVCacheEvictionsTotalMetricName,
+			Help: "Total number of blocks evicted to make space for new blocks (any priority).",
+		},
+		[]string{api.PromLabelModelName},
+	)
+	if err := s.metrics.registry.Register(s.metrics.kvCacheEvictionsTotal); err != nil {
+		s.logger.Error(err, "prometheus kv cache evictions counter register failed")
+		return err
+	}
+
 	s.metrics.priorityStatsChan = common.Channel[kvcache.PrioritySnapshot]{
 		Channel: make(chan kvcache.PrioritySnapshot, maxNumberOfRequests),
 		Name:    "metrics.priorityStatsChan",
@@ -557,6 +575,17 @@ func (s *SimContext) reportPriorityStats(snap kvcache.PrioritySnapshot) {
 			s.metrics.kvCachePinnedEvictionsTotal.WithLabelValues(model).Add(float64(delta))
 		}
 		s.metrics.lastPinnedEvictions = snap.PinnedEvictions
+	}
+	if s.metrics.kvCacheEvictionsTotal != nil {
+		delta := snap.TotalEvictions - s.metrics.lastEvictions
+		if delta < 0 {
+			// Counter reset (block cache recreated) -- treat the snapshot as the new total.
+			delta = snap.TotalEvictions
+		}
+		if delta > 0 {
+			s.metrics.kvCacheEvictionsTotal.WithLabelValues(model).Add(float64(delta))
+		}
+		s.metrics.lastEvictions = snap.TotalEvictions
 	}
 }
 
