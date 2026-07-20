@@ -150,6 +150,14 @@ func ParseCommandParamsAndLoadConfig() (*Configuration, error) {
 
 	f.BoolVar(&config.EnableKVCache, "enable-kvcache", config.EnableKVCache, "Defines if KV cache feature is enabled")
 	f.IntVar(&config.KVCacheSize, "kv-cache-size", config.KVCacheSize, "Maximum number of token blocks in kv cache")
+	f.StringVar(&config.EvictionPolicy, "eviction-policy", config.EvictionPolicy,
+		"Block-cache eviction policy: lru (default) or slru (probation/protected segments + ghost set)")
+	f.Float64Var(&config.SLRUProtectedRatio, "slru-protected-ratio", config.SLRUProtectedRatio,
+		"Fraction of kv-cache-size reserved for the SLRU protected segment (0-1 exclusive)")
+	f.StringVar(&config.RetentionDirectiveMode, "retention-directive-mode", config.RetentionDirectiveMode,
+		"How retention directives are applied: pin (TTL'd retention marks, default) or promote (SLRU segment placement, requires eviction-policy=slru)")
+	f.Float64Var(&config.PinBudgetFrac, "pin-budget-frac", config.PinBudgetFrac,
+		"Cap on the fraction of kv-cache-size held by live retention pins (0-1]; pins past the cap degrade to LRU. 1.0 (default) is uncapped (RFC-0001 §4, E5)")
 	f.Float64Var(&config.GlobalCacheHitThreshold, "global-cache-hit-threshold", 0, "Default cache hit threshold [0, 1] for all requests. If a request specifies cache_hit_threshold, it takes precedence")
 	f.IntVar(&config.TokenBlockSize, "block-size", config.TokenBlockSize, "Token block size for contiguous chunks of tokens, possible values: 8,16,32,64,128")
 	f.StringVar(&config.HashSeed, "hash-seed", config.HashSeed,

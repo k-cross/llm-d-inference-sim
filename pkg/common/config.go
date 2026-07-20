@@ -52,6 +52,13 @@ const (
 	ChatCmplToolIDPrefix = "chatcmpl-tool-"
 	MessagesToolIDPrefix = "toolu_"
 
+	// Block-cache eviction policies (E2, docs/e2-policy-plan.md in the bench repo).
+	EvictionPolicyLRU  = "lru"
+	EvictionPolicySLRU = "slru"
+	// Retention-directive application modes (RFC-0001).
+	RetentionModePin     = "pin"
+	RetentionModePromote = "promote"
+
 	podIPEnv = "POD_IP"
 
 	DefaultLatencyCalculator        = ""
@@ -210,6 +217,26 @@ type Configuration struct {
 	EnableKVCache bool `yaml:"enable-kvcache" json:"enable-kvcache"`
 	//  KVCacheSize is the maximum number of token blocks in kv cache, the default value is 1024
 	KVCacheSize int `yaml:"kv-cache-size" json:"kv-cache-size"`
+	// EvictionPolicy selects the block-cache eviction policy: "lru" (default) or "slru"
+	// (segmented LRU with probation/protected segments and a ghost set, mirroring the
+	// upstream CPU-offload policy of vllm#38984).
+	EvictionPolicy string `yaml:"eviction-policy" json:"eviction-policy"`
+	// SLRUProtectedRatio is the fraction of kv-cache-size reserved for the SLRU protected
+	// segment (0-1 exclusive), defaults to 0.5. Only meaningful with eviction-policy=slru.
+	SLRUProtectedRatio float64 `yaml:"slru-protected-ratio" json:"slru-protected-ratio"`
+	// RetentionDirectiveMode selects how retention directives (RFC-0001) are applied:
+	// "pin" (default) records TTL'd retention marks honored by the evictor; "promote"
+	// (requires eviction-policy=slru) maps a directive to SLRU segment placement instead --
+	// priority > 0 promotes the prefix to protected, priority < 0 demotes it to probation;
+	// no mark, no lease, no pinned accounting.
+	RetentionDirectiveMode string `yaml:"retention-directive-mode" json:"retention-directive-mode"`
+	// PinBudgetFrac caps the fraction of kv-cache-size that may be held by live retention
+	// pins (RFC-0001 §4, E5 admission control). Once the resident high+pinned band reaches
+	// this fraction, a further pin directive is degraded to plain LRU rather than honored,
+	// bounding the over-pinning collapse. (0, 1]; 1.0 (default) is uncapped -- today's
+	// behavior. The cap is aggregate (global) here; the accounting stays keyed by scope so a
+	// per-scope budget (E7 fairness) is a small follow-on.
+	PinBudgetFrac float64 `yaml:"pin-budget-frac" json:"pin-budget-frac"`
 	// GlobalCacheHitThreshold is the default cache hit threshold (0-1] for all requests.
 	// If a request specifies cache_hit_threshold, it takes precedence over this global value.
 	GlobalCacheHitThreshold float64 `yaml:"global-cache-hit-threshold" json:"global-cache-hit-threshold"`
@@ -362,6 +389,10 @@ func newConfig() *Configuration {
 		ToolCallNotRequiredParamProbability: 50,
 		ObjectToolCallNotRequiredParamProbability: 50,
 		KVCacheSize:                1024,
+		EvictionPolicy:             EvictionPolicyLRU,
+		SLRUProtectedRatio:         0.5,
+		RetentionDirectiveMode:     RetentionModePin,
+		PinBudgetFrac:              1.0,
 		TokenBlockSize:             16,
 		ZMQEndpoint:                "tcp://127.0.0.1:5557",
 		EventBatchSize:             16,
@@ -543,6 +574,21 @@ func (c *Configuration) validate() error {
 
 	if c.KVCacheSize < 0 {
 		return errors.New("KV cache size cannot be negative")
+	}
+	if c.EvictionPolicy != EvictionPolicyLRU && c.EvictionPolicy != EvictionPolicySLRU {
+		return errors.New("eviction policy should be one of the following: lru, slru")
+	}
+	if c.SLRUProtectedRatio <= 0 || c.SLRUProtectedRatio >= 1 {
+		return errors.New("SLRU protected ratio should be between 0 and 1 exclusive")
+	}
+	if c.RetentionDirectiveMode != RetentionModePin && c.RetentionDirectiveMode != RetentionModePromote {
+		return errors.New("retention directive mode should be one of the following: pin, promote")
+	}
+	if c.RetentionDirectiveMode == RetentionModePromote && c.EvictionPolicy != EvictionPolicySLRU {
+		return errors.New("retention directive mode promote requires eviction policy slru")
+	}
+	if c.PinBudgetFrac <= 0 || c.PinBudgetFrac > 1 {
+		return errors.New("pin budget fraction should be in the range (0, 1]")
 	}
 	if c.EventBatchSize < 1 {
 		return errors.New("event batch size cannot less than 1")

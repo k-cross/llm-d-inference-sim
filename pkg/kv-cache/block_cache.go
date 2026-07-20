@@ -62,6 +62,15 @@ type PrioritySnapshot struct {
 	PinnedUsagePerc  float64 // (high + pinned) unexpired blocks / maxBlocks; excludes evict-first
 	PinnedEvictions  int     // cumulative counter
 	TotalEvictions   int     // cumulative count of blocks evicted to make space (any priority)
+	// BudgetDegradations is the cumulative count of pin directives degraded to plain LRU
+	// because the live high+pinned band was already at the pin budget (RFC-0001 §4, E5).
+	BudgetDegradations int
+	// SLRU segment accounting (E2); all zero under the lru policy.
+	ProbationBlocks    int // resident blocks in the probation segment
+	ProtectedBlocks    int // resident blocks in the protected segment
+	ProbationEvictions int // cumulative counter
+	ProtectedEvictions int // cumulative counter
+	GhostHits          int // cumulative counter: re-inserts that skipped probation via the ghost set
 }
 
 // retentionMark is a block's live retention directive (RFC-0001 §1): a numeric priority
@@ -79,22 +88,46 @@ type retentionMark struct {
 
 // blockCache represents a thread-safe cache for blocks with eviction policy
 type blockCache struct {
-	mu                sync.RWMutex
-	requestToBlocks   map[string][]blockKey              // request id -> array of it blocks (block hashes)
-	usedBlocks        map[blockKey]int                   // block hash -> reference count
-	unusedBlocks      map[blockKey]time.Time             // block hash -> last usage timestamp
-	blockToTokens     map[blockKey][]uint32              // block hash -> block tokens
-	retention         map[blockKey]retentionMark         // block hash -> live retention directive (RFC-0001)
-	pinnedEvictions   int                                // marked-and-unexpired blocks evicted under pressure (RFC-0001 §4)
-	totalEvictions    int                                // any block evicted to make space for a new one (cache-contention signal)
-	loadedModels      map[string]struct{}                // models currently loaded (base model + loaded loras)
-	maxBlocks         int                                // maximum number of blocks in the cache
-	eventSender       *KVEventSender                     // emits kv events
-	eventChan         common.Channel[EventData]          // channel for asynchronous event processing
-	usageChan         *common.Channel[common.MetricInfo] // channel for usage reporting
-	priorityStatsChan *common.Channel[PrioritySnapshot]  // per-band block counts + pinned-usage (RFC-0001 §4)
-	logger            logr.Logger
-	disabled          bool // indicated whether the cache is disabled
+	mu              sync.RWMutex
+	requestToBlocks map[string][]blockKey      // request id -> array of it blocks (block hashes)
+	usedBlocks      map[blockKey]int           // block hash -> reference count
+	unusedBlocks    map[blockKey]time.Time     // block hash -> last usage timestamp
+	blockToTokens   map[blockKey][]uint32      // block hash -> block tokens
+	retention       map[blockKey]retentionMark // block hash -> live retention directive (RFC-0001)
+	pinnedEvictions int                        // marked-and-unexpired blocks evicted under pressure (RFC-0001 §4)
+	totalEvictions  int                        // any block evicted to make space for a new one (cache-contention signal)
+
+	// Pin-budget admission (RFC-0001 §4, E5): once the resident high+pinned band reaches
+	// pinBudgetBlocks, a further pin directive is degraded to plain LRU so aggregate retention
+	// cannot exceed the budget and drive the over-pinning collapse. The cap is aggregate
+	// (global); the per-block scope on retentionMark keeps a per-scope budget (E7) a small
+	// follow-on. pinBudgetEnabled is false at frac 1.0, keeping the uncapped path unchanged.
+	pinBudgetEnabled   bool
+	pinBudgetBlocks    int
+	budgetDegradations int                                // cumulative
+	loadedModels       map[string]struct{}                // models currently loaded (base model + loaded loras)
+	maxBlocks          int                                // maximum number of blocks in the cache
+	eventSender        *KVEventSender                     // emits kv events
+	eventChan          common.Channel[EventData]          // channel for asynchronous event processing
+	usageChan          *common.Channel[common.MetricInfo] // channel for usage reporting
+	priorityStatsChan  *common.Channel[PrioritySnapshot]  // per-band block counts + pinned-usage (RFC-0001 §4)
+	logger             logr.Logger
+	disabled           bool // indicated whether the cache is disabled
+
+	// SLRU state (eviction-policy=slru, mirroring the vllm#38984 offload policy; inert
+	// under lru). Membership in protected is the segment bit: a resident block is
+	// protected iff present here, probation otherwise. The ghost set remembers hashes of
+	// recently evicted protected blocks so a returning prefix skips probation.
+	evictionPolicy     string
+	directiveMode      string                // pin (retention marks) or promote (segment hints)
+	protectedCap       int                   // max protected blocks (slru-protected-ratio x maxBlocks)
+	protected          map[blockKey]struct{} // resident protected-segment members
+	ghost              map[blockKey]struct{} // recently evicted protected hashes
+	ghostQueue         []blockKey            // FIFO ordering that bounds ghost to ghostCap
+	ghostCap           int                   // == maxBlocks, upstream's capacity-scaled sizing
+	probationEvictions int                   // cumulative, slru only
+	protectedEvictions int                   // cumulative, slru only
+	ghostHits          int                   // cumulative, slru only
 }
 
 // newBlockCache creates a new blockCache with the specified maximum number of blocks
@@ -134,6 +167,17 @@ func newBlockCache(ctx context.Context, config *common.Configuration, logger log
 		priorityStatsChan: priorityStatsChan,
 		eventSender:       eventSender,
 		logger:            logger,
+		evictionPolicy:    config.EvictionPolicy,
+		directiveMode:     config.RetentionDirectiveMode,
+		protectedCap:      int(config.SLRUProtectedRatio * float64(config.KVCacheSize)),
+		protected:         make(map[blockKey]struct{}),
+		ghost:             make(map[blockKey]struct{}),
+		ghostCap:          config.KVCacheSize,
+		// Enabled only for a real cap in (0, 1): frac 1.0 (default) is uncapped, and the 0.0
+		// zero value from a bare Configuration literal (config validation forbids <=0 on the
+		// real path) means unset -> disabled, so the uncapped path is byte-for-byte unchanged.
+		pinBudgetEnabled: config.PinBudgetFrac > 0 && config.PinBudgetFrac < 1.0,
+		pinBudgetBlocks:  int(config.PinBudgetFrac * float64(config.KVCacheSize)),
 	}
 
 	// mark the base model and all it aliases as always loaded,
@@ -167,6 +211,9 @@ func (bc *blockCache) discard() {
 	bc.unusedBlocks = make(map[blockKey]time.Time)
 	bc.blockToTokens = make(map[blockKey][]uint32)
 	bc.retention = make(map[blockKey]retentionMark)
+	bc.protected = make(map[blockKey]struct{})
+	bc.ghost = make(map[blockKey]struct{})
+	bc.ghostQueue = nil
 
 	common.WriteToChannel(bc.eventChan,
 		EventData{action: eventActionAllBlocksCleared},
@@ -255,12 +302,14 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 	// for blocks that are already in use - update the reference
 	for _, block := range blockAlreadyInUse {
 		bc.usedBlocks[block] += 1
+		bc.promote(block) // SLRU: a re-reference is a second access
 	}
 
 	// for block used in the past - move them to the used blocks collection
 	for _, block := range blockToMoveToUsed {
 		bc.usedBlocks[block] = 1
 		delete(bc.unusedBlocks, block)
+		bc.promote(block) // SLRU: a re-reference is a second access
 	}
 
 	// for new block - add them, if there is no empty slots - evict a block using priority:
@@ -274,6 +323,7 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 			// cache is full but contains unused blocks - evict one block
 			bc.totalEvictions++
 			evictHash := bc.pickBlockToEvict()
+			bc.noteEviction(evictHash)
 			delete(bc.unusedBlocks, evictHash)
 			delete(bc.retention, evictHash)
 			common.WriteToChannel(bc.eventChan,
@@ -289,14 +339,42 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 		// Add the new block
 		bc.usedBlocks[block.key] = 1
 
+		// SLRU: a new block enters probation, unless the ghost set remembers it as a
+		// recently evicted protected block -- then it re-enters protected directly
+		// (vllm#38984's fast recovery after transient pressure).
+		if bc.evictionPolicy == common.EvictionPolicySLRU {
+			if _, ok := bc.ghost[block.key]; ok {
+				delete(bc.ghost, block.key)
+				bc.ghostHits++
+				bc.promote(block.key)
+			}
+		}
+
 		hashes = append(hashes, block.key.hash)
 		tokens = append(tokens, bc.blockToTokens[block.key]...)
 	}
 
-	var priority *int
-	var retainUntil *float64
 	now := time.Now()
 	directive := req.GetRetentionDirective()
+	// E5 pin-budget admission (RFC-0001 §4): degrade a pin (priority > 0) to plain LRU when
+	// honoring it would push the live high+pinned band past the budget, so aggregate retention
+	// cannot exceed the cap and drive the over-pinning collapse. The test is a *fit* check on
+	// the blocks this request would newly pin (its already-pinned prefix -- e.g. a shared
+	// system prompt -- adds nothing), not a coarse "already at cap": a single returning turn
+	// can pin a large prefix at once, so a coarse rule overshoots the cap by a whole prefix.
+	// Evict-first (priority < 0) is never budgeted -- it only frees cache. Promote mode records
+	// no retention marks, so it is left untouched.
+	if bc.pinBudgetEnabled && directive != nil && directive.Priority > 0 &&
+		bc.directiveMode != common.RetentionModePromote {
+		current, wouldAdd := bc.pinAdmission(blockHashes, req.GetDisplayedModel(), now)
+		if current+wouldAdd > bc.pinBudgetBlocks {
+			bc.budgetDegradations++
+			directive = nil
+		}
+	}
+
+	var priority *int
+	var retainUntil *float64
 	if directive != nil {
 		p := directive.Priority
 		priority = &p
@@ -331,7 +409,21 @@ func (bc *blockCache) startRequest(req Request, blockHashes []uint64, blockToken
 	// common non-agentic workload on the zero-overhead fast path.
 	reqBlocks := bc.requestToBlocks[req.GetRequestID()]
 
-	if directive != nil {
+	if directive != nil && bc.directiveMode == common.RetentionModePromote {
+		// Promote mode (E2 arm 4, soft integration): a directive is an SLRU segment hint,
+		// not a lease -- priority above normal promotes the prefix to protected, evict-first
+		// demotes it to probation, and nothing is recorded in bc.retention, so there is no
+		// pin, no TTL, and no pinned accounting. Segment placement is engine-internal state
+		// (not a priority change), so no BlockStored re-emit either.
+		for _, bKey := range reqBlocks {
+			switch {
+			case directive.Priority > 0:
+				bc.promote(bKey)
+			case directive.Priority < 0:
+				bc.demote(bKey)
+			}
+		}
+	} else if directive != nil {
 		// newBlocksSet is only needed to skip re-emitting blocks stored moments ago above,
 		// so build it only on the directive path -- the common unmarked workload stays
 		// allocation-free here (RFC-0001 §4 zero-overhead invariant).
@@ -533,6 +625,9 @@ func (c *lruCandidate) consider(bk blockKey, loaded bool, t time.Time) {
 // expired leases as it goes, so the no-directive fast path re-engages once all leases
 // lapse. Must be called with bc.mu held.
 func (bc *blockCache) pickBlockToEvict() blockKey {
+	if bc.evictionPolicy == common.EvictionPolicySLRU {
+		return bc.pickBlockToEvictSLRU()
+	}
 	// Fast path: no live directives anywhere -> plain unloaded-first LRU, no per-block
 	// retention lookups, preserving zero overhead for non-agentic workloads.
 	if len(bc.retention) == 0 {
@@ -581,6 +676,125 @@ func (bc *blockCache) pickBlockToEvict() blockKey {
 	return marked
 }
 
+// pickBlockToEvictSLRU is the segmented-LRU eviction order (E2): the unmarked band is
+// split into probation < protected, giving evict-first < probation < protected < marked
+// overall. Probation is always drained first (upstream's "eviction prefers probation"),
+// so a protected block is only sacrificed when no probation block is resident. In
+// promote directive mode bc.retention is always empty and the marked bands are inert.
+// Must be called with bc.mu held.
+func (bc *blockCache) pickBlockToEvictSLRU() blockKey {
+	now := time.Now()
+	var evictFirst, probation, protected lruCandidate
+	var marked blockKey
+	var markedMark retentionMark
+	var markedTime time.Time
+	haveMarked := false
+
+	for bk, t := range bc.unusedBlocks {
+		mark, isMarked := bc.retention[bk]
+		if isMarked && !now.Before(mark.expiry) {
+			delete(bc.retention, bk) // lease lapsed -> prune and treat as unmarked
+			isMarked = false
+		}
+		_, loaded := bc.loadedModels[bk.modelName]
+		switch {
+		case !isMarked:
+			if _, prot := bc.protected[bk]; prot {
+				protected.consider(bk, loaded, t)
+			} else {
+				probation.consider(bk, loaded, t)
+			}
+		case mark.priority < 0:
+			evictFirst.consider(bk, loaded, t)
+		case !haveMarked || markLessValuable(mark.priority, mark.expiry, t,
+			markedMark.priority, markedMark.expiry, markedTime):
+			marked, markedMark, markedTime, haveMarked = bk, mark, t, true
+		}
+	}
+
+	if evictFirst.have {
+		return evictFirst.key
+	}
+	if probation.have {
+		return probation.key
+	}
+	if protected.have {
+		return protected.key
+	}
+	bc.pinnedEvictions++
+	return marked
+}
+
+// noteEviction updates the SLRU segment bookkeeping for a block chosen for eviction:
+// a protected victim is counted, dropped from the segment, and remembered in the ghost
+// set (only protected evictions feed the ghost, per vllm#38984); a probation victim is
+// just counted. No-op under lru. Must be called with bc.mu held, before the caller
+// deletes the block.
+func (bc *blockCache) noteEviction(bk blockKey) {
+	if bc.evictionPolicy != common.EvictionPolicySLRU {
+		return
+	}
+	if _, prot := bc.protected[bk]; prot {
+		delete(bc.protected, bk)
+		bc.protectedEvictions++
+		bc.ghostAdd(bk)
+	} else {
+		bc.probationEvictions++
+	}
+}
+
+// ghostAdd remembers an evicted protected block's key, evicting the oldest ghost
+// entries past ghostCap. The FIFO queue may hold stale entries already consumed by a
+// ghost hit; popping one is a harmless no-op delete. Must be called with bc.mu held.
+func (bc *blockCache) ghostAdd(bk blockKey) {
+	if _, ok := bc.ghost[bk]; ok {
+		return
+	}
+	bc.ghost[bk] = struct{}{}
+	bc.ghostQueue = append(bc.ghostQueue, bk)
+	for len(bc.ghost) > bc.ghostCap && len(bc.ghostQueue) > 0 {
+		oldest := bc.ghostQueue[0]
+		bc.ghostQueue = bc.ghostQueue[1:]
+		delete(bc.ghost, oldest)
+	}
+}
+
+// promote places a resident block in the SLRU protected segment (second access, ghost
+// hit, or a promote-mode directive). Past the protected cap, the least-recently-used
+// *unused* protected block is demoted back to probation at MRU position; if every
+// protected block is in flight the cap is soft and the segment temporarily overflows
+// (an in-use block is un-evictable anyway). No-op under lru. Must be called with bc.mu
+// held.
+func (bc *blockCache) promote(bk blockKey) {
+	if bc.evictionPolicy != common.EvictionPolicySLRU {
+		return
+	}
+	if _, ok := bc.protected[bk]; ok {
+		return
+	}
+	bc.protected[bk] = struct{}{}
+	if len(bc.protected) <= bc.protectedCap {
+		return
+	}
+	var lru lruCandidate
+	for k := range bc.protected {
+		if t, ok := bc.unusedBlocks[k]; ok {
+			_, loaded := bc.loadedModels[k.modelName]
+			lru.consider(k, loaded, t)
+		}
+	}
+	if lru.have {
+		delete(bc.protected, lru.key)
+		bc.unusedBlocks[lru.key] = time.Now() // demote to probation MRU
+	}
+}
+
+// demote drops a block out of the protected segment (evict-first hint in promote
+// directive mode). Must be called with bc.mu held.
+func (bc *blockCache) demote(bk blockKey) {
+	delete(bc.protected, bk)
+}
+
 // markLessValuable reports whether mark A is a better eviction target than mark B: lower
 // priority wins; on a tie the soonest-expiring lease; on a further tie the older block.
 // (All marks carry a bounded, non-zero expiry, so there is no persistent-lease case.)
@@ -592,6 +806,37 @@ func markLessValuable(prioA int, expiryA, timeA time.Time, prioB int, expiryB, t
 		return expiryA.Before(expiryB)
 	}
 	return timeA.Before(timeB)
+}
+
+// countPinnedBlocks returns the number of resident blocks held by a live (unexpired) pin --
+// priority > 0 marks (high or pinned), the band the pin budget caps (RFC-0001 §4, E5).
+// Expired leases are not pruned here (this is a read on the admission path); pickBlockToEvict
+// and pushPriorityStats do the pruning. Must be called with bc.mu held.
+func (bc *blockCache) countPinnedBlocks(now time.Time) int {
+	n := 0
+	for _, mark := range bc.retention {
+		if mark.priority > 0 && now.Before(mark.expiry) {
+			n++
+		}
+	}
+	return n
+}
+
+// pinAdmission returns the current live-pinned block count and wouldAdd -- how many of
+// blockHashes are not already live-pinned, i.e. the increment this pin would add to the band
+// (RFC-0001 §4, E5). Admitting the pin keeps the band at current+wouldAdd, so the caller
+// degrades it when that would exceed the budget. Counting only the *new* blocks means a
+// returning request that merely refreshes its own already-pinned prefix costs nothing.
+// Must be called with bc.mu held.
+func (bc *blockCache) pinAdmission(blockHashes []uint64, model string, now time.Time) (current, wouldAdd int) {
+	current = bc.countPinnedBlocks(now)
+	for _, h := range blockHashes {
+		mark, ok := bc.retention[blockKey{hash: h, modelName: model}]
+		if !ok || mark.priority <= 0 || !now.Before(mark.expiry) {
+			wouldAdd++
+		}
+	}
+	return current, wouldAdd
 }
 
 // getPinnedEvictions returns the number of marked-and-unexpired blocks evicted under
@@ -619,7 +864,21 @@ func (bc *blockCache) pushPriorityStats() {
 	if bc.priorityStatsChan == nil {
 		return
 	}
-	snap := PrioritySnapshot{PinnedEvictions: bc.pinnedEvictions, TotalEvictions: bc.totalEvictions}
+	snap := PrioritySnapshot{
+		PinnedEvictions:    bc.pinnedEvictions,
+		TotalEvictions:     bc.totalEvictions,
+		BudgetDegradations: bc.budgetDegradations,
+	}
+	if bc.evictionPolicy == common.EvictionPolicySLRU {
+		// Segment split of the resident set: membership in bc.protected is the segment
+		// bit, so probation is the remainder. Counters are cumulative like the eviction
+		// counters above.
+		snap.ProtectedBlocks = len(bc.protected)
+		snap.ProbationBlocks = len(bc.usedBlocks) + len(bc.unusedBlocks) - len(bc.protected)
+		snap.ProbationEvictions = bc.probationEvictions
+		snap.ProtectedEvictions = bc.protectedEvictions
+		snap.GhostHits = bc.ghostHits
+	}
 	if len(bc.retention) > 0 {
 		now := time.Now()
 		for bk, mark := range bc.retention {
